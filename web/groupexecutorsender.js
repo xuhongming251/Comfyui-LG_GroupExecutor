@@ -117,7 +117,8 @@ app.registerExtension({
                         
                         enrichedExecutionList.push({
                             ...exec,
-                            output_node_ids: outputNodes.map(n => n.id)
+                            output_node_ids: outputNodes.map(n => n.id),
+                            server_id: exec.server_id || null  // 保留服务器ID信息
                         });
                     }
                     
@@ -217,6 +218,55 @@ app.registerExtension({
 
                     checkQueue();
                 });
+            };
+
+            // 设置组执行结果到文件系统
+            nodeType.prototype.setGroupResultToFile = async function(groupName) {
+                try {
+                    // 获取最新的 execution_id
+                    const response = await api.fetchApi('/group_executor/results/latest/id');
+                    if (!response.ok) {
+                        // 如果没有找到 execution_id，说明可能没有 GroupExecutorWaitAll 节点在等待
+                        console.log(`[GroupExecutorSender] 未找到执行任务，跳过设置结果: ${groupName}`);
+                        return;
+                    }
+                    
+                    const data = await response.json();
+                    if (data.status !== "success" || !data.execution_id) {
+                        console.log(`[GroupExecutorSender] 未找到执行ID，跳过设置结果: ${groupName}`);
+                        return;
+                    }
+                    
+                    const execution_id = data.execution_id;
+                    
+                    // 设置组结果
+                    const setResponse = await api.fetchApi('/group_executor/results/set', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            execution_id: execution_id,
+                            group_name: groupName,
+                            result_data: {
+                                completed: true,
+                                completed_at: new Date().toISOString()
+                            }
+                        })
+                    });
+                    
+                    if (setResponse.ok) {
+                        const setData = await setResponse.json();
+                        if (setData.status === "success") {
+                            console.log(`[GroupExecutorSender] 组 "${groupName}" 结果已设置到文件系统: ${execution_id}`);
+                        } else {
+                            console.warn(`[GroupExecutorSender] 设置组结果失败: ${setData.message}`);
+                        }
+                    } else {
+                        console.warn(`[GroupExecutorSender] 设置组结果API调用失败: ${setResponse.status}`);
+                    }
+                } catch (error) {
+                    // 静默失败，不影响主流程
+                    console.warn(`[GroupExecutorSender] 设置组结果到文件系统时出错:`, error);
+                }
             };
 
             nodeType.prototype.cancelExecution = async function() {
@@ -323,15 +373,18 @@ app.registerExtension({
                                 continue;
                             }
 
-                            for (let i = 0; i < repeat_count; i++) {
+                            // repeat_count = 1 表示不重复，只执行一次
+                            // repeat_count > 1 表示重复执行
+                            if (repeat_count === 1) {
+                                // 只执行一次，不进入循环
                                 if (node.properties.isCancelling) {
-                                    break;
+                                    continue;
                                 }
 
                                 currentTask++;
                                 const progress = (currentTask / totalTasks) * 100;
                                 node.updateStatus(
-                                    `执行组: ${group_name} (${currentTask}/${totalTasks}) - 第${i + 1}/${repeat_count}次`,
+                                    `执行组: ${group_name} (${currentTask}/${totalTasks})`,
                                     progress
                                 );
                                 
@@ -345,15 +398,70 @@ app.registerExtension({
                                     
                                     try {
                                         if (node.properties.isCancelling) {
-                                            break;
+                                            continue;
                                         }
                                         await queueManager.queueOutputNodes(nodeIds);
                                         await node.waitForQueue();
+                                        
+                                        // 组执行完成，尝试设置结果到文件系统
+                                        await node.setGroupResultToFile(group_name);
                                     } catch (queueError) {
                                         if (node.properties.isCancelling) {
-                                            break;
+                                            continue;
                                         }
                                         console.warn(`[GroupExecutorSender] 队列执行失败，使用默认方式:`, queueError);
+                                        for (const n of outputNodes) {
+                                            if (node.properties.isCancelling) {
+                                                break;
+                                            }
+                                            if (n.triggerQueue) {
+                                                await n.triggerQueue();
+                                                await node.waitForQueue();
+                                            }
+                                        }
+                                        
+                                        // 组执行完成，尝试设置结果到文件系统
+                                        await node.setGroupResultToFile(group_name);
+                                    }
+                                } catch (error) {
+                                    throw new Error(`执行组 "${group_name}" 失败: ${error.message}`);
+                                }
+                            } else {
+                                // repeat_count > 1，进入循环重复执行
+                                for (let i = 0; i < repeat_count; i++) {
+                                    if (node.properties.isCancelling) {
+                                        break;
+                                    }
+
+                                    currentTask++;
+                                    const progress = (currentTask / totalTasks) * 100;
+                                    node.updateStatus(
+                                        `执行组: ${group_name} (${currentTask}/${totalTasks}) - 第${i + 1}/${repeat_count}次`,
+                                        progress
+                                    );
+                                    
+                                    try {
+                                        const outputNodes = node.getGroupOutputNodes(group_name);
+                                        if (!outputNodes || !outputNodes.length) {
+                                            throw new Error(`组 "${group_name}" 中没有找到输出节点`);
+                                        }
+
+                                        const nodeIds = outputNodes.map(n => n.id);
+                                        
+                                        try {
+                                            if (node.properties.isCancelling) {
+                                                break;
+                                            }
+                                            await queueManager.queueOutputNodes(nodeIds);
+                                            await node.waitForQueue();
+                                            
+                                            // 组执行完成，尝试设置结果到文件系统
+                                            await node.setGroupResultToFile(group_name);
+                                        } catch (queueError) {
+                                            if (node.properties.isCancelling) {
+                                                break;
+                                            }
+                                            console.warn(`[GroupExecutorSender] 队列执行失败，使用默认方式:`, queueError);
                                             for (const n of outputNodes) {
                                                 if (node.properties.isCancelling) {
                                                     break;
@@ -363,18 +471,22 @@ app.registerExtension({
                                                     await node.waitForQueue();
                                                 }
                                             }
+                                            
+                                            // 组执行完成，尝试设置结果到文件系统
+                                            await node.setGroupResultToFile(group_name);
                                         }
-                                    
-
-                                    if (delay_seconds > 0 && (i < repeat_count - 1 || currentTask < totalTasks) && !node.properties.isCancelling) {
-                                        node.updateStatus(
-                                            `执行组: ${group_name} (${currentTask}/${totalTasks}) - 等待 ${delay_seconds}s`,
-                                            progress
-                                        );
-                                        await new Promise(resolve => setTimeout(resolve, delay_seconds * 1000));
+                                        
+                                        // 延迟（支持中断）- 只在重复执行时才有延迟
+                                        if (delay_seconds > 0 && i < repeat_count - 1 && !node.properties.isCancelling) {
+                                            node.updateStatus(
+                                                `执行组: ${group_name} (${currentTask}/${totalTasks}) - 等待 ${delay_seconds}s`,
+                                                progress
+                                            );
+                                            await new Promise(resolve => setTimeout(resolve, delay_seconds * 1000));
+                                        }
+                                    } catch (error) {
+                                        throw new Error(`执行组 "${group_name}" 失败: ${error.message}`);
                                     }
-                                } catch (error) {
-                                    throw new Error(`执行组 "${group_name}" 失败: ${error.message}`);
                                 }
                             }
                             

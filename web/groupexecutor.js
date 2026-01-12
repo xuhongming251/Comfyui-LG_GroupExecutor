@@ -228,10 +228,13 @@ class GroupExecutorNode extends BaseNode {
         }
         this.properties.isExecuting = true;
         this.properties.isCancelling = false;
-        const totalSteps = this.properties.repeatCount * this.properties.groupCount;
+        // repeatCount = 1 表示不重复，只执行一次
+        // repeatCount > 1 表示重复执行
+        const totalSteps = this.properties.repeatCount === 1 ? this.properties.groupCount : this.properties.repeatCount * this.properties.groupCount;
         let currentStep = 0;
         try {
-            for (let repeat = 0; repeat < this.properties.repeatCount; repeat++) {
+            if (this.properties.repeatCount === 1) {
+                // 只执行一次，不进入循环
                 for (let i = 0; i < this.properties.groupCount; i++) {
                     if (this.properties.isCancelling) {
                         console.log('[GroupExecutor] 执行被用户取消');
@@ -286,11 +289,70 @@ class GroupExecutorNode extends BaseNode {
                         }
                     }
                 }
-                if (repeat < this.properties.repeatCount - 1) {
-                    if (this.properties.isCancelling) {
-                        return;
+            } else {
+                // repeatCount > 1，进入循环重复执行
+                for (let repeat = 0; repeat < this.properties.repeatCount; repeat++) {
+                    for (let i = 0; i < this.properties.groupCount; i++) {
+                        if (this.properties.isCancelling) {
+                            console.log('[GroupExecutor] 执行被用户取消');
+                            await api.interrupt();
+                            this.updateStatus("已取消");
+                            setTimeout(() => this.resetStatus(), 2000);
+                            return;
+                        }
+                        const groupName = this.properties.groups[i];
+                        if (!groupName) continue;
+                        currentStep++;
+                        this.updateStatus(
+                            `${currentStep}/${totalSteps} - ${groupName} (${repeat + 1}/${this.properties.repeatCount})`
+                        );
+                        const outputNodes = this.getGroupOutputNodes(groupName);
+                        if (outputNodes && outputNodes.length > 0) {
+                            try {
+                                const nodeIds = outputNodes.map(n => n.id);
+                                try {
+                                    if (this.properties.isCancelling) {
+                                        return;
+                                    }
+                                    await queueManager.queueOutputNodes(nodeIds);
+                                    await this.waitForQueue();
+                                } catch (queueError) {
+                                    if (this.properties.isCancelling) {
+                                        return;
+                                    }
+                                    console.warn(`[GroupExecutorSender] 队列执行失败，使用默认方式:`, queueError);
+                                    for (const n of outputNodes) {
+                                        if (this.properties.isCancelling) {
+                                            return;
+                                        }
+                                        if (n.triggerQueue) {
+                                            await n.triggerQueue();
+                                            await this.waitForQueue();
+                                        }
+                                    }
+                                }
+                                if (i < this.properties.groupCount - 1) {
+                                    if (this.properties.isCancelling) {
+                                        return;
+                                    }
+                                    this.updateStatus(
+                                        `等待 ${this.properties.delaySeconds}s...`
+                                    );
+                                    await this.delay(this.properties.delaySeconds);
+                                }
+                            } catch (error) {
+                                    console.error(`[GroupExecutor] 执行组 ${groupName} 时发生错误:`, error);
+                                    throw error;
+                                }
+                            }
+                        }
                     }
-                    await this.delay(this.properties.delaySeconds);
+                    if (repeat < this.properties.repeatCount - 1) {
+                        if (this.properties.isCancelling) {
+                            return;
+                        }
+                        await this.delay(this.properties.delaySeconds);
+                    }
                 }
             }
             if (!this.properties.isCancelling) {
