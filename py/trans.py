@@ -85,9 +85,18 @@ class LG_ImageSender:
 
                 if masks is not None and idx < len(masks):
                     mask = masks[idx].squeeze()
-                    mask_img = Image.fromarray(np.clip(255. * (1 - mask.cpu().numpy()), 0, 255).astype(np.uint8))
+                    mask_array = np.clip(255. * (1 - mask.cpu().numpy()), 0, 255).astype(np.uint8)
+                    mask_img = Image.fromarray(mask_array, mode='L')
+                    
+                    # 确保 mask 尺寸与 rgb_image 匹配
+                    if mask_img.size != rgb_image.size:
+                        mask_img = mask_img.resize(rgb_image.size, Image.Resampling.LANCZOS)
                 else:
                     mask_img = Image.new('L', rgb_image.size, 255)
+
+                # 确保 mask_img 是 'L' 模式
+                if mask_img.mode != 'L':
+                    mask_img = mask_img.convert('L')
 
                 r, g, b = rgb_image.convert('RGB').split()
                 rgba_image = Image.merge('RGBA', (r, g, b, mask_img))
@@ -216,9 +225,18 @@ class LG_ImageSenderPlus:
 
                 if masks is not None and idx < len(masks):
                     mask = masks[idx].squeeze()
-                    mask_img = Image.fromarray(np.clip(255. * (1 - mask.cpu().numpy()), 0, 255).astype(np.uint8))
+                    mask_array = np.clip(255. * (1 - mask.cpu().numpy()), 0, 255).astype(np.uint8)
+                    mask_img = Image.fromarray(mask_array, mode='L')
+                    
+                    # 确保 mask 尺寸与 rgb_image 匹配
+                    if mask_img.size != rgb_image.size:
+                        mask_img = mask_img.resize(rgb_image.size, Image.Resampling.LANCZOS)
                 else:
                     mask_img = Image.new('L', rgb_image.size, 255)
+
+                # 确保 mask_img 是 'L' 模式
+                if mask_img.mode != 'L':
+                    mask_img = mask_img.convert('L')
 
                 r, g, b = rgb_image.convert('RGB').split()
                 rgba_image = Image.merge('RGBA', (r, g, b, mask_img))
@@ -1166,6 +1184,13 @@ except:
     REMOTE_RESULTS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "execution_status", "remote_results")
 os.makedirs(REMOTE_RESULTS_DIR, exist_ok=True)
 
+# 状态文件存储目录（用于配置文件）
+try:
+    STATUS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "execution_status")
+except:
+    STATUS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "execution_status")
+os.makedirs(STATUS_DIR, exist_ok=True)
+
 # 线程局部存储：用于在执行时传递组名
 _execution_context = threading.local()
 
@@ -1238,10 +1263,9 @@ def _get_safe_filename(name):
     return safe_name
 
 class LG_RemoteTextSender:
-    """远程文本发送器：将文本保存到文件中（用于远端服务器异步执行）"""
+    """远程文本发送器：将文本保存到配置文件中（用于远端服务器异步执行）"""
     def __init__(self):
-        self.accumulated_texts = []
-        self.results_dir = REMOTE_RESULTS_DIR
+        self.status_dir = STATUS_DIR
         
     @classmethod
     def INPUT_TYPES(s):
@@ -1249,7 +1273,6 @@ class LG_RemoteTextSender:
             "required": {
                 "text": ("STRING", {"multiline": True, "default": "", "tooltip": "要发送的文本内容"}),
                 "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
-                "accumulate": ("BOOLEAN", {"default": False, "tooltip": "开启后将累积所有文本一起发送"}), 
             },
             "optional": {
                 "signal_opt": (any_typ, {"tooltip": "信号输入，将在处理完成后原样输出"})
@@ -1266,23 +1289,16 @@ class LG_RemoteTextSender:
     OUTPUT_NODE = True
 
     @classmethod
-    def IS_CHANGED(s, text, link_id, accumulate, prompt=None, extra_pnginfo=None, unique_id=None):
-        if isinstance(accumulate, list):
-            accumulate = accumulate[0]
-        
-        if accumulate:
-            return float("NaN") 
-        
+    def IS_CHANGED(s, text, link_id, prompt=None, extra_pnginfo=None, unique_id=None):
         # 获取组名用于hash计算
         group_name = _get_group_name_from_prompt(prompt, extra_pnginfo, unique_id)
-        # 非积累模式下计算hash
-        hash_value = hash(str(text) + str(group_name))
+        # 计算hash
+        hash_value = hash(str(text) + str(group_name) + str(link_id))
         return hash_value
 
-    def save_text(self, text, link_id, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None, unique_id=None):
+    def save_text(self, text, link_id, signal_opt=None, prompt=None, extra_pnginfo=None, unique_id=None):
         text = text[0] if isinstance(text, list) else text
         link_id = link_id[0] if isinstance(link_id, list) else link_id
-        accumulate = accumulate[0] if isinstance(accumulate, list) else accumulate
         
         # 处理 signal_opt（INPUT_IS_LIST=True 时，输入是列表）
         if signal_opt is not None:
@@ -1301,40 +1317,61 @@ class LG_RemoteTextSender:
             print(f"[RemoteTextSender] 警告：组名为空，使用默认组名 'default'")
             group_name = "default"
         
-        # 累积文本
-        if accumulate:
-            if text:
-                self.accumulated_texts.append(text)
+        # 处理文本
+        save_text = text if text else ""
         
-        # 确定要保存的文本
-        if accumulate:
-            save_text = "\n".join(self.accumulated_texts) if self.accumulated_texts else ""
-        else:
-            save_text = text if text else ""
+        # 按组名和link_id创建配置文件
+        safe_group_name = _get_safe_filename(group_name)
+        config_filename = f"{safe_group_name}_{link_id}.json"
+        config_file_path = os.path.join(self.status_dir, config_filename)
         
-        # 保存文本到文件
-        if save_text:
-            # 生成文件名：{group_name}_{link_id}.txt
-            safe_group_name = _get_safe_filename(group_name)
-            filename = f"{safe_group_name}_{link_id}.txt"
-            file_path = os.path.join(self.results_dir, filename)
+        try:
+            # 确保目录存在
+            os.makedirs(self.status_dir, exist_ok=True)
             
-            try:
-                # 确保目录存在
-                os.makedirs(self.results_dir, exist_ok=True)
-                
-                # 写入文件
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(save_text)
-                
-                print(f"[RemoteTextSender] 保存文本到文件 (group_name={group_name}, link_id={link_id}): {file_path}, {len(save_text)} 字符")
-            except Exception as e:
-                print(f"[RemoteTextSender] 保存文本文件失败: {str(e)}")
-                import traceback
-                traceback.print_exc()
-        
-        if not accumulate:
-            self.accumulated_texts = []
+            # 如果配置文件已存在，保留created_at字段
+            created_at = time.time()
+            if os.path.exists(config_file_path):
+                try:
+                    with open(config_file_path, 'r', encoding='utf-8') as f:
+                        existing_data = json.load(f)
+                    # 保留原有的created_at时间
+                    if "created_at" in existing_data:
+                        created_at = existing_data["created_at"]
+                except:
+                    pass
+            
+            # 构建配置文件数据（OUTPUT_NODE执行时任务已完成）
+            config_data = {
+                "group_name": group_name,
+                "link_id": link_id,
+                "result_text": save_text,
+                "completed": True,  # OUTPUT_NODE执行时任务已完成
+                "completed_at": time.time(),
+                "created_at": created_at
+            }
+            
+            # 写入配置文件
+            temp_file = config_file_path + ".tmp"
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(config_data, f, ensure_ascii=False, indent=2)
+            # 原子性替换
+            if os.path.exists(config_file_path):
+                os.remove(config_file_path)
+            os.rename(temp_file, config_file_path)
+            
+            print(f"[RemoteTextSender] 保存文本到配置文件 (group_name={group_name}, link_id={link_id}): {config_file_path}, {len(save_text)} 字符")
+        except Exception as e:
+            print(f"[RemoteTextSender] 保存配置文件失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # 清理临时文件
+            temp_file = config_file_path + ".tmp"
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
         
         # OUTPUT_IS_LIST=(True,) 要求返回列表
         return (signal_output,)
@@ -1416,9 +1453,18 @@ class LG_RemoteImageSenderPlus:
 
                 if masks is not None and idx < len(masks):
                     mask = masks[idx].squeeze()
-                    mask_img = Image.fromarray(np.clip(255. * (1 - mask.cpu().numpy()), 0, 255).astype(np.uint8))
+                    mask_array = np.clip(255. * (1 - mask.cpu().numpy()), 0, 255).astype(np.uint8)
+                    mask_img = Image.fromarray(mask_array, mode='L')
+                    
+                    # 确保 mask 尺寸与 rgb_image 匹配
+                    if mask_img.size != rgb_image.size:
+                        mask_img = mask_img.resize(rgb_image.size, Image.Resampling.LANCZOS)
                 else:
                     mask_img = Image.new('L', rgb_image.size, 255)
+
+                # 确保 mask_img 是 'L' 模式
+                if mask_img.mode != 'L':
+                    mask_img = mask_img.convert('L')
 
                 r, g, b = rgb_image.convert('RGB').split()
                 rgba_image = Image.merge('RGBA', (r, g, b, mask_img))
@@ -1502,17 +1548,19 @@ class LG_RemoteImageSenderPlus:
         
         return (signal_output,)
 
-class LG_RemoteTextReceiverPlus:
-    """远程文本接收器：从文件中读取文本结果（用于本地服务器读取远端执行结果）"""
+class LG_RemoteTextReceiver:
+    """远程文本接收器：从配置文件中读取文本结果（用于本地服务器读取远端执行结果）"""
+    def __init__(self):
+        self.status_dir = STATUS_DIR
+    
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "group_name": ("STRING", {"default": "", "multiline": False, "tooltip": "组名，用于查找文件"}),
+                "group_name": ("STRING", {"default": "", "multiline": False, "tooltip": "组名，用于查找配置文件"}),
                 "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID，需与发送端link_id匹配"}),
             },
             "optional": {
-                "default_text": ("STRING", {"multiline": True, "default": "", "tooltip": "如果文件不存在，返回的默认文本"}),
                 "signal": (any_typ, {"tooltip": "信号输入，将在处理完成后原样输出"}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -1521,11 +1569,11 @@ class LG_RemoteTextReceiverPlus:
     RETURN_TYPES = ("STRING", any_typ)
     RETURN_NAMES = ("text", "signal")
     CATEGORY = CATEGORY_TYPE
-    OUTPUT_IS_LIST = (False,)
+    OUTPUT_IS_LIST = (False, False)
     FUNCTION = "load_text"
     INPUT_IS_LIST = False
 
-    def load_text(self, group_name, link_id, default_text="", signal=None, unique_id=None):
+    def load_text(self, group_name, link_id, signal=None, unique_id=None):
         # 处理输入（可能来自列表）
         if isinstance(group_name, list):
             group_name = group_name[0] if group_name else ""
@@ -1535,41 +1583,40 @@ class LG_RemoteTextReceiverPlus:
             link_id = link_id[0] if link_id else 1
         link_id = link_id if link_id else 1
         
-        if isinstance(default_text, list):
-            default_text = default_text[0] if default_text else ""
-        default_text = default_text if default_text else ""
-        
         # 处理 signal（原样输出）
         signal_output = signal
         
         if not group_name:
-            print(f"[RemoteTextReceiverPlus] 警告：组名为空，无法读取文件")
-            return (default_text, signal_output)
+            print(f"[RemoteTextReceiver] 警告：组名为空，无法读取配置文件")
+            return ("", signal_output)
         
-        # 生成文件名：{group_name}_{link_id}.txt
+        # 生成配置文件路径：{group_name}_{link_id}.json
         safe_group_name = _get_safe_filename(group_name)
-        filename = f"{safe_group_name}_{link_id}.txt"
-        file_path = os.path.join(REMOTE_RESULTS_DIR, filename)
+        config_filename = f"{safe_group_name}_{link_id}.json"
+        config_file_path = os.path.join(self.status_dir, config_filename)
         
-        print(f"[RemoteTextReceiverPlus] 尝试读取文本文件 (group_name={group_name}, link_id={link_id}): {file_path}")
+        print(f"[RemoteTextReceiver] 尝试读取配置文件 (group_name={group_name}, link_id={link_id}): {config_file_path}")
         
         try:
-            if os.path.exists(file_path):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-                print(f"[RemoteTextReceiverPlus] 成功读取文本文件: {len(text)} 字符")
+            if os.path.exists(config_file_path):
+                with open(config_file_path, 'r', encoding='utf-8') as f:
+                    config_data = json.load(f)
+                
+                # 从配置文件中读取 result_text 字段
+                text = config_data.get("result_text", "")
+                print(f"[RemoteTextReceiver] 成功读取配置文件: {len(text)} 字符")
                 return (text, signal_output)
             else:
-                print(f"[RemoteTextReceiverPlus] 文件不存在: {file_path}，返回默认文本")
-                return (default_text, signal_output)
+                print(f"[RemoteTextReceiver] 配置文件不存在: {config_file_path}，返回空文本")
+                return ("", signal_output)
         except Exception as e:
-            print(f"[RemoteTextReceiverPlus] 读取文本文件失败: {str(e)}")
+            print(f"[RemoteTextReceiver] 读取配置文件失败: {str(e)}")
             import traceback
             traceback.print_exc()
-            return (default_text, signal_output)
+            return ("", signal_output)
     
     @classmethod
-    def IS_CHANGED(s, group_name, link_id, default_text="", signal=None, unique_id=None):
+    def IS_CHANGED(s, group_name, link_id, signal=None, unique_id=None):
         # 计算hash以检测变化
         hash_value = hash(str(group_name) + str(link_id))
         return hash_value

@@ -23,6 +23,16 @@ except ImportError:
 
 CATEGORY_TYPE = "🎈LAOGOU/Group"
 
+class AnyType(str):
+    """用于表示任意类型的特殊类，在类型比较时总是返回相等"""
+    def __eq__(self, _) -> bool:
+        return True
+
+    def __ne__(self, __value: object) -> bool:
+        return False
+
+any_typ = AnyType("*")
+
 # ============ 后台执行辅助函数 ============
 
 def recursive_add_nodes(node_id, old_output, new_output):
@@ -824,6 +834,9 @@ class GroupResultManager:
         self.status_dir = status_dir or STATUS_DIR
         self.lock = threading.Lock()
         os.makedirs(self.status_dir, exist_ok=True)
+        # 远程结果文件存储目录
+        self.remote_results_dir = os.path.join(self.status_dir, "remote_results")
+        os.makedirs(self.remote_results_dir, exist_ok=True)
     
     def _get_status_file(self, execution_id):
         """获取状态文件路径"""
@@ -837,6 +850,50 @@ class GroupResultManager:
         safe_name = "".join(c for c in group_name if c.isalnum() or c in ('_', '-', ' '))
         safe_name = safe_name.replace(' ', '_')  # 将空格替换为下划线
         return os.path.join(self.status_dir, f"{safe_name}.json")
+    
+    def _clear_group_result_files(self, group_name):
+        """清除该组的所有历史结果文件（包括图像和文本结果文件）
+        
+        Args:
+            group_name: 组名
+        """
+        try:
+            # 生成安全的组名（与文件命名规则一致）
+            safe_group_name = "".join(c for c in group_name if c.isalnum() or c in ('_', '-', ' '))
+            safe_group_name = safe_group_name.replace(' ', '_')
+            
+            deleted_count = 0
+            
+            # 清除图像结果文件（在 remote_results 目录中）
+            if os.path.exists(self.remote_results_dir):
+                for filename in os.listdir(self.remote_results_dir):
+                    # 匹配格式：{group_name}_{link_id}_{index}.png 或 {group_name}_{link_id}_{index}_preview.jpg
+                    if filename.startswith(f"{safe_group_name}_") and (filename.endswith('.png') or filename.endswith('_preview.jpg')):
+                        file_path = os.path.join(self.remote_results_dir, filename)
+                        try:
+                            os.remove(file_path)
+                            deleted_count += 1
+                        except Exception as e:
+                            print(f"[GroupResultManager] 删除图像结果文件失败: {file_path}, 错误: {e}")
+            
+            # 清除文本结果文件（在 status_dir 目录中，格式：{group_name}_{link_id}.json）
+            if os.path.exists(self.status_dir):
+                for filename in os.listdir(self.status_dir):
+                    # 匹配格式：{group_name}_{link_id}.json（排除组状态文件本身，即 {group_name}.json）
+                    if filename.startswith(f"{safe_group_name}_") and filename.endswith('.json') and filename != f"{safe_group_name}.json":
+                        file_path = os.path.join(self.status_dir, filename)
+                        try:
+                            os.remove(file_path)
+                            deleted_count += 1
+                        except Exception as e:
+                            print(f"[GroupResultManager] 删除文本结果文件失败: {file_path}, 错误: {e}")
+            
+            if deleted_count > 0:
+                print(f"[GroupResultManager] 已清除组 '{group_name}' 的 {deleted_count} 个历史结果文件（包括图像和文本）")
+        except Exception as e:
+            print(f"[GroupResultManager] 清除组历史结果文件失败: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _load_status(self, execution_id):
         """从组名配置文件中加载状态（通过查找包含该execution_id的组名配置文件）"""
@@ -1229,14 +1286,30 @@ class GroupResultManager:
                     pass
             
             # 构建状态数据，合并现有数据（优化后的结构，只包含单个组的信息）
+            # 如果提供了 prompt_id，表示新任务开始，completed 应该为 False
+            # 如果没有提供 prompt_id，则从现有数据中继承 completed 状态
+            if prompt_id:
+                # 新任务开始，设置为未完成
+                completed_status = False
+                completed_at_value = None
+                # 新任务开始时，清除该组的所有历史结果文件
+                self._clear_group_result_files(group_name)
+            else:
+                # 没有提供新的 prompt_id，从现有数据继承
+                completed_status = existing_data.get("completed", False) if existing_data else False
+                completed_at_value = existing_data.get("completed_at") if existing_data else None
+            
+            # 计算 started_at 的值
+            started_at_value = started_at if started_at else (existing_data.get("started_at") if existing_data else time.time())
+            
             status_data = {
                 "group_name": group_name,
                 "server_id": server_id,
-                "completed": existing_data.get("completed", False) if existing_data else False,
-                "started_at": started_at if started_at else (existing_data.get("started_at") if existing_data else time.time()),
-                "completed_at": existing_data.get("completed_at") if existing_data else None,
+                "completed": completed_status,
+                "started_at": started_at_value,
+                "completed_at": completed_at_value,
                 "prompt_id": prompt_id if prompt_id else (existing_data.get("prompt_id") if existing_data else None),
-                "created_at": time.time()
+                "created_at": started_at_value  # created_at 应该使用 started_at 的值（组配置启动时间）
             }
             
             # 如果提供了execution_id，合并到状态数据中
@@ -1290,6 +1363,9 @@ class GroupResultManager:
                 with open(status_file, 'r', encoding='utf-8') as f:
                     status_data = json.load(f)
                 
+                # 获取 execution_id
+                execution_id = status_data.get("execution_id")
+                
                 # 更新状态（优化后的结构，只包含单个组的信息）
                 status_data["completed"] = True
                 status_data["completed_at"] = time.time()
@@ -1309,9 +1385,16 @@ class GroupResultManager:
                     os.remove(status_file)
                 os.rename(temp_file, status_file)
                 print(f"[GroupResultManager] 更新组状态文件（已完成）: {status_file}")
+                
+                # 在组任务完成时，根据 execution_id 和组名，确保图片和蒙版已保存到文件中
+                if execution_id:
+                    self._ensure_images_saved_for_group(group_name, execution_id)
+                
                 return True
             except Exception as e:
                 print(f"[GroupResultManager] 更新组状态文件失败: {e}")
+                import traceback
+                traceback.print_exc()
                 # 清理临时文件
                 temp_file = status_file + ".tmp"
                 if os.path.exists(temp_file):
@@ -1320,6 +1403,50 @@ class GroupResultManager:
                     except:
                         pass
                 return False
+    
+    def _ensure_images_saved_for_group(self, group_name, execution_id):
+        """在组任务完成时，根据 execution_id 和组名，确保图片和蒙版已保存到文件中
+        
+        Args:
+            group_name: 组名
+            execution_id: 执行ID
+        """
+        try:
+            # 生成安全的组名（与文件命名规则一致）
+            safe_group_name = "".join(c for c in group_name if c.isalnum() or c in ('_', '-', ' '))
+            safe_group_name = safe_group_name.replace(' ', '_')
+            
+            # 生成安全的 execution_id（用于文件名）
+            safe_execution_id = "".join(c for c in execution_id if c.isalnum() or c in ('_', '-'))
+            
+            # 检查 remote_results 目录中是否存在该组的图片文件
+            if not os.path.exists(self.remote_results_dir):
+                print(f"[GroupResultManager] 远程结果目录不存在: {self.remote_results_dir}")
+                return
+            
+            # 查找所有匹配的图片文件（格式：{group_name}_{link_id}_{index}.png）
+            image_files = []
+            for filename in os.listdir(self.remote_results_dir):
+                # 匹配格式：{group_name}_{link_id}_{index}.png
+                if filename.startswith(f"{safe_group_name}_") and filename.endswith('.png') and not filename.endswith('_preview.jpg'):
+                    image_files.append(filename)
+            
+            if image_files:
+                print(f"[GroupResultManager] 组 '{group_name}' (execution_id={execution_id}) 完成，已找到 {len(image_files)} 个图片文件")
+                # 图片文件已经在执行过程中由 LG_RemoteImageSenderPlus 保存
+                # 这里只需要确认文件存在即可
+                for filename in image_files:
+                    file_path = os.path.join(self.remote_results_dir, filename)
+                    if os.path.exists(file_path):
+                        print(f"[GroupResultManager] 确认图片文件已保存: {filename}")
+                    else:
+                        print(f"[GroupResultManager] 警告: 图片文件不存在: {filename}")
+            else:
+                print(f"[GroupResultManager] 组 '{group_name}' (execution_id={execution_id}) 完成，但未找到图片文件")
+        except Exception as e:
+            print(f"[GroupResultManager] 确保图片保存失败: {e}")
+            import traceback
+            traceback.print_exc()
     
     def load_status_by_group(self, group_name):
         """按组名加载状态文件
@@ -1534,6 +1661,7 @@ class GroupExecutorWaitAll:
             },
             "optional": {
                 "signal": ("SIGNAL",),
+                "any_input": ("*",),   # 👈 任意类型输入
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1548,6 +1676,53 @@ class GroupExecutorWaitAll:
     CATEGORY = CATEGORY_TYPE
     OUTPUT_NODE = True  # 标记为输出节点，确保在组中单独存在时也能被执行
     
+    @classmethod
+    def _get_group_list(cls, unique_id=None, prompt=None, extra_pnginfo=None):
+        """从节点的配置中获取组名列表"""
+        group_list = []
+        if prompt and unique_id:
+            # 从prompt中获取当前节点的配置
+            node_data = prompt.get(str(unique_id), {})
+            node_inputs = node_data.get("inputs", {})
+            
+            # 尝试从properties中获取组名列表
+            # 前端会将组名列表存储在properties中
+            if "group_names" in node_inputs:
+                group_names_str = node_inputs.get("group_names", "")
+                if group_names_str:
+                    group_list = [name.strip() for name in group_names_str.split('\n') if name.strip()]
+        
+        # 如果从prompt中获取不到，尝试从extra_pnginfo中获取
+        if not group_list and extra_pnginfo:
+            workflow = extra_pnginfo.get("workflow", {})
+            nodes = workflow.get("nodes", [])
+            for node in nodes:
+                node_id = node.get("id")
+                # 兼容字符串和整数类型的ID
+                if str(node_id) == str(unique_id) or node_id == unique_id:
+                    props = node.get("properties", {})
+                    if "groupNames" in props:
+                        group_names_list = props.get("groupNames", [])
+                        if isinstance(group_names_list, list):
+                            group_list = [name for name in group_names_list if name]
+                        elif isinstance(group_names_list, str):
+                            group_list = [name.strip() for name in group_names_list.split('\n') if name.strip()]
+                    # 也尝试旧的字段名
+                    elif "group_names" in props:
+                        group_names_list = props.get("group_names", [])
+                        if isinstance(group_names_list, list):
+                            group_list = [name for name in group_names_list if name]
+                        elif isinstance(group_names_list, str):
+                            group_list = [name.strip() for name in group_names_list.split('\n') if name.strip()]
+                    break
+        
+        return group_list
+    
+    @classmethod
+    def IS_CHANGED(cls, timeout_seconds, signal=None, any_input=None, unique_id=None, prompt=None, extra_pnginfo=None):
+        """让节点每次都执行"""
+        return time.time()
+    
     def _get_execution_id(self, prompt=None, unique_id=None):
         """自动获取execution_id：使用unique_id和时间戳生成唯一的execution_id，确保每次运行都有不同的ID"""
         # 使用unique_id和时间戳生成唯一的execution_id
@@ -1560,46 +1735,11 @@ class GroupExecutorWaitAll:
         
         return execution_id
     
-    def wait_all(self, timeout_seconds, signal=None, unique_id=None, prompt=None, extra_pnginfo=None):
+    def wait_all(self, timeout_seconds, signal=None, any_input=None, unique_id=None, prompt=None, extra_pnginfo=None):
         try:
             # 从节点的properties中获取组名列表
             # 这些组名是通过前端UI选择的
-            group_list = []
-            if prompt and unique_id:
-                # 从prompt中获取当前节点的配置
-                node_data = prompt.get(str(unique_id), {})
-                node_inputs = node_data.get("inputs", {})
-                
-                # 尝试从properties中获取组名列表
-                # 前端会将组名列表存储在properties中
-                if "group_names" in node_inputs:
-                    group_names_str = node_inputs.get("group_names", "")
-                    if group_names_str:
-                        group_list = [name.strip() for name in group_names_str.split('\n') if name.strip()]
-            
-            # 如果从prompt中获取不到，尝试从extra_pnginfo中获取
-            if not group_list and extra_pnginfo:
-                workflow = extra_pnginfo.get("workflow", {})
-                nodes = workflow.get("nodes", [])
-                for node in nodes:
-                    node_id = node.get("id")
-                    # 兼容字符串和整数类型的ID
-                    if str(node_id) == str(unique_id) or node_id == unique_id:
-                        props = node.get("properties", {})
-                        if "groupNames" in props:
-                            group_names_list = props.get("groupNames", [])
-                            if isinstance(group_names_list, list):
-                                group_list = [name for name in group_names_list if name]
-                            elif isinstance(group_names_list, str):
-                                group_list = [name.strip() for name in group_names_list.split('\n') if name.strip()]
-                        # 也尝试旧的字段名
-                        elif "group_names" in props:
-                            group_names_list = props.get("group_names", [])
-                            if isinstance(group_names_list, list):
-                                group_list = [name for name in group_names_list if name]
-                            elif isinstance(group_names_list, str):
-                                group_list = [name.strip() for name in group_names_list.split('\n') if name.strip()]
-                        break
+            group_list = self._get_group_list(unique_id, prompt, extra_pnginfo)
             
             if not group_list:
                 raise ValueError("组名列表不能为空，请在前端UI中选择组")

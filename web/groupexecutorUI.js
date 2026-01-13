@@ -660,6 +660,17 @@ class GroupExecutorUI {
                 border-radius: 4px;
                 font-size: 12px;
             }
+            .ge-single-group-server-select {
+                min-width: 120px;
+                max-width: 150px;
+                padding: 4px 8px;
+                background: #333;
+                border: 1px solid #444;
+                color: #fff;
+                border-radius: 4px;
+                font-size: 12px;
+                margin-right: 8px;
+            }
         `;
         document.head.appendChild(style);
         document.body.appendChild(this.container);
@@ -1605,11 +1616,16 @@ class GroupExecutorUI {
             this.updateSingleModeList();
         }
     }
-    updateSingleModeList() {
+    async updateSingleModeList() {
         const container = this.container.querySelector('.ge-groups-list');
         const searchInput = this.container.querySelector('.ge-search-input');
         const clearButton = this.container.querySelector('.ge-search-clear');
         const groupNames = this.getGroupNames();
+        
+        // 如果服务器列表未加载，先加载
+        if (!this.servers || this.servers.length === 0) {
+            await this.updateServerSelects();
+        }
         
         const filterGroups = (searchText) => {
             const normalizedSearch = searchText.toLowerCase();
@@ -1619,18 +1635,33 @@ class GroupExecutorUI {
         };
 
         const renderGroups = (filteredGroups) => {
-            container.innerHTML = filteredGroups.map(name => `
-                <div class="ge-group-item" data-group="${name}">
+            container.innerHTML = '';
+            
+            filteredGroups.forEach(name => {
+                const item = document.createElement('div');
+                item.className = 'ge-group-item';
+                item.setAttribute('data-group', name);
+                
+                item.innerHTML = `
                     <span class="ge-group-name">${name}</span>
+                    <select class="ge-single-group-server-select" data-group="${name}"></select>
                     <div class="ge-group-controls">
                         <button class="ge-execute-single-btn">执行</button>
                         <button class="ge-cancel-single-btn" disabled>取消</button>
                     </div>
-                </div>
-            `).join('');
-
-            container.querySelectorAll('.ge-group-item').forEach(item => {
-                const groupName = item.dataset.group;
+                `;
+                
+                container.appendChild(item);
+                
+                // 初始化服务器选择器
+                const serverSelect = item.querySelector('.ge-single-group-server-select');
+                this.updateServerSelectOptions(serverSelect);
+                
+                // 设置默认服务器
+                if (this.defaultServerId) {
+                    serverSelect.value = this.defaultServerId;
+                }
+                
                 const executeBtn = item.querySelector('.ge-execute-single-btn');
                 const cancelBtn = item.querySelector('.ge-cancel-single-btn');
                 
@@ -1642,8 +1673,9 @@ class GroupExecutorUI {
                     this.isCancelling = false;
                     
                     try {
-                        await this.executeGroup(groupName);
-                        this.updateStatus(`组 "${groupName}" 执行完成`);
+                        const serverId = serverSelect.value || this.defaultServerId || null;
+                        await this.executeGroup(name, serverId);
+                        this.updateStatus(`组 "${name}" 执行完成`);
                     } catch (error) {
                         this.updateStatus(`执行失败: ${error.message}`);
                         console.error(error);
@@ -2153,9 +2185,17 @@ class GroupExecutorUI {
                 this.servers = result.servers || [];
                 this.defaultServerId = result.default_server || null;
                 
-                // 更新所有组选择器的服务器下拉框
+                // 更新所有组选择器的服务器下拉框（多组模式）
                 const serverSelects = this.container.querySelectorAll('.ge-group-server-select');
                 serverSelects.forEach(select => {
+                    const currentServerId = select.value || this.defaultServerId;
+                    this.updateServerSelectOptions(select);
+                    select.value = currentServerId || this.defaultServerId || '';
+                });
+                
+                // 更新单组模式的服务器下拉框
+                const singleServerSelects = this.container.querySelectorAll('.ge-single-group-server-select');
+                singleServerSelects.forEach(select => {
                     const currentServerId = select.value || this.defaultServerId;
                     this.updateServerSelectOptions(select);
                     select.value = currentServerId || this.defaultServerId || '';
